@@ -9,20 +9,15 @@ import warnings
 import gc
 import re
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from deepspeed.runtime.zero.utils import apply_to_tensors_only
-from deepspeed.utils import z3_leaf_parameter
-from deepspeed.utils import logger
 from transformers.integrations import is_deepspeed_zero3_enabled
 import logging
 
-logger.setLevel(logging.WARNING) # surpress the tedious info log from deepspeed when switching trainable blocks
+if is_deepspeed_zero3_enabled():
+    from deepspeed.runtime.zero.utils import apply_to_tensors_only
+    from deepspeed.utils import z3_leaf_parameter
+    from deepspeed.utils import logger
 
-# Optional [0, 1, 2]. 
-    # 0: no print
-    # 1: print the relative time whenever a parameter's grad is ready
-    # 2: for debug usage only. Will set all the parameters trainable, print the grad ready time for each parameter. 
-    #     In this case, all the grad except the "specified" trainable parameters will be set to None after being calculated.
-BACKWARD_VERBOSE = 0
+logger.setLevel(logging.WARNING) # surpress the tedious info log from deepspeed when switching trainable blocks
 
 def print_rank_0(s, force=True):
     if not torch.distributed.is_initialized():
@@ -54,36 +49,33 @@ class BlockOptimizer(Optimizer):
         include_embedding=False,
         include_lm_head=False,
         verbose: Optional[int] = 1,
-        log_fn = None,
         lora_mode = "all",
         n_layer_per_block = 1,
         lr_warmup_step_afterswitch = None,
-        init_avgsq_scale = False,
         sgd_mode = "disabled",
         sgd_lr_scaling = 1.,
         sgd_use_sign = False
     ):
         """
         Args:
-            base_optimizer (Optimizer): The base optimizer being wrapped by the BlockOptimizer.
+            base_optimizer: The base optimizer being wrapped by the BlockOptimizer.
             named_parameters_list: A function that generates the named parameters of the model.
-            block_prefix_list (List[List[str]]): The list of blocks of parameters to be updated.
-            switch_block_every (int, optional): The number of optimization steps before switching to the next block.
-            start_block (Optional[int], optional): The index of the block to start with.
-            switch_mode (str, optional): The mode for switching between different blocks of parameters.
+            block_prefix_list: The list of blocks of parameters to be updated.
+            switch_block_every: The number of optimization steps before switching to the next block.
+            start_block (int): The index of the block to start with.
+            switch_mode: Options: ["ascending", "descending", "random"] The block update order.
             active_modules (List[str]): The list of modules that are always active during optimization.
-            verbose (int, optional): The verbosity level for printing information during optimization.
-            log_fn: A logging function for recording information during optimization.
-            ds_zero3_enabled: Whether to use DeepSpeed ZeRO-3.
+            verbose: The verbosity level for printing information during optimization.
             lora_mode: Options: ["all", "partial", "adapter_only"]. Invalid when there is no LoRA module.
                 "all" means all the LoRA modules will be trained, while "partial" means only the LoRA modules after the active block will be trained.
                 "adapter_only" means only the LoRA modules will be trained.
             lr_warmup_step_afterswitch: The number of steps for the learning rate warmup after switching to a new block.
-            init_avgsq_scale: Whether to initialize the second moment of the Adam optimizer with a specified scale.
             sgd_mode: Options: ["disabled", "all", "partial"]. When grad is ready, perform sgd update and drop the grad. This will not incur much memory overhead but will induce additional computation overhead.
                 "all" means for each backward pass, all the parameters will perform one sgd step.
                 "partial" means only the params of the later layers of the active block will perform sgd.
                 "disabled" means sgd update is disabled.
+            sgd_lr_scaling: The scaling factor for the learning rate during SGD update.
+            sgd_use_sign: Whether to use sign SGD update.
         """
         self.switch_mode = switch_mode
         
@@ -99,7 +91,6 @@ class BlockOptimizer(Optimizer):
         self.weight_decay = base_optimizer.param_groups[0]["weight_decay"]
         self.block_prefix_list = block_prefix_list
         self.block_num = len(block_prefix_list)
-        self.log_fn = log_fn
         self.global_step = 0
         self.base_optimizer = base_optimizer
         self.active_modules = active_modules
@@ -107,12 +98,7 @@ class BlockOptimizer(Optimizer):
         self.ds_zero3_enabled = is_deepspeed_zero3_enabled()
         self.lr_warmup_step_afterswitch = lr_warmup_step_afterswitch
         self.lora_mode = lora_mode
-        self.init_avgsq_scale = init_avgsq_scale
         self.sgd_mode = sgd_mode
-
-        # if self.sgd_mode != "disabled":
-        #     # assert self.lora_mode == "adapter_only", "SGD update is not compatible with LoRA's update"
-        #     assert not self.ds_zero3_enabled, "ZeRO-3 is not implemented for SGD update"
 
         self.param_groups = base_optimizer.param_groups
         self.state_dict = base_optimizer.state_dict # for compatibility of hf Trainer
@@ -142,25 +128,14 @@ class BlockOptimizer(Optimizer):
                 "This will cause additional memory usage and lose the benefit of mixed precision training.")
             
         super().__init__(self.param_groups, base_optimizer.defaults)
-        
-        if BACKWARD_VERBOSE:
-            self.record_mark = True
-            self.ordered_named_params = []
-            self.param_num = len(named_parameters_list)
-            for n, p in named_parameters_list:
-                p.register_post_accumulate_grad_hook(self.test_hook(n))
 
         if self.sgd_mode != "disabled":
             for n, p in named_parameters_list:
                 p.register_post_accumulate_grad_hook(self.sgd_hook(n, lr_scaling=sgd_lr_scaling, use_sign=sgd_use_sign))
             if sgd_use_sign:
-                print_rank_0("sgd update with sign is enabled")
+                print_rank_0("SignSGD is enabled")
 
         self.switch_trainable_params()
-
-        if BACKWARD_VERBOSE == 2:
-            for name, param in self.named_parameters_list:
-                param.requires_grad_(True)
     
     @property
     def embedding_layer(self):
@@ -205,42 +180,10 @@ class BlockOptimizer(Optimizer):
             block_prefix_list = merge_block(block_prefix_list, n_layer_per_block, self.switch_mode)
         
         return block_prefix_list
-                
-    def test_hook(self, name):
-        """hook used for recording the time of gradient calculation, see comments on BACKWARD_VERBOSE for more details."""
-        
-        def func(x):
-            if self.record_mark:
-                self.backward_start_time = time.time()          
-                self.record_mark = False
-                relative_time = 0.
-            else:
-                relative_time = time.time() - self.backward_start_time
-            if any(p_name in name for p_name in self.active_param_prefixs):
-                print_rank_0(f"param: {name:<50} relative time: {relative_time}")
-            
-            iterator = self.named_parameters_list
-                
-            for n, p in iterator:
-                
-                if p.requires_grad and p.grad is not None:
-                    print_rank_0("parameter name: ", n, "relative time", time.time() - self.backward_start_time)
-                    
-                    if (not any(p_name in n for p_name in self.active_param_prefixs)) and \
-                        BACKWARD_VERBOSE == 2:
-                        p.grad = None
-                    
-                    if len(self.ordered_named_params) < self.param_num:
-                        self.ordered_named_params.append((n, p))
-                    # break since for each step only one parameter's grad is updated
-                    break
-            return x
-        
-        return func
 
     def sgd_hook(self, n, lr_scaling=1., use_sign=False):
         """hook for performing sgd update on the fly"""
-        # TODO: handle the weight decay
+        # TODO: deal with the case where different parameters have different lr
 
         def sgd_update(p):
             # no sgd for the active block params
@@ -270,8 +213,10 @@ class BlockOptimizer(Optimizer):
             partitioned_grad_fp32 = one_dim_grad_fp32.narrow(0, start, end - start)
 
             partitioned_p = param_fp32.narrow(0, 0, end - start)
-            # partitioned_p.add_(partitioned_grad_fp32, alpha=-self.param_groups[0]["lr"] * lr_scaling)
-            partitioned_p.add_(partitioned_grad_fp32, alpha=0.)
+            if use_sign:
+                partitioned_p.add_(partitioned_grad_fp32.sign(), alpha=-self.param_groups[0]["lr"] * lr_scaling)
+            else:
+                partitioned_p.add_(partitioned_grad_fp32, alpha=-self.param_groups[0]["lr"] * lr_scaling)
             p.ds_tensor[: end - start] = partitioned_p
 
         return sgd_update_zero3 if self.ds_zero3_enabled else sgd_update
@@ -289,7 +234,6 @@ class BlockOptimizer(Optimizer):
             correction_ratio = 1.
         else:
             correction_ratio = min(1., (cur_block_step + 1) / self.lr_warmup_step_afterswitch)
-        # print(f"lr:", self.param_groups[0]["lr"])
         for group in self.base_optimizer.param_groups:
             scheduled_lr = self.param_groups[0]["lr"]
             group["lr"] = scheduled_lr * correction_ratio
@@ -504,10 +448,6 @@ class BlockOptimizer(Optimizer):
         elif self.lora_mode == "adapter_only":
             self.active_param_prefixs = [n for n in param_names if "lora" in n and any(pref in n for pref in self.active_param_prefixs)]
 
-        # avgsq_scale = self._cal_adam_lr_scale_mean()
-        if isinstance(self.base_optimizer, torch.optim.Adam):
-            avgsq_scale = self._cal_avgsq_mean()
-
         if self.ds_zero3_enabled:
             self._switch_trainable_params_zero3()
             
@@ -516,9 +456,6 @@ class BlockOptimizer(Optimizer):
         
         # Clean the optimizer state
         self.base_optimizer.state = defaultdict(lambda: {})
-        
-        if self.init_avgsq_scale and avgsq_scale != 0:
-            self._set_init_avgsq_scale(avgsq_scale)
 
         self._update_active_block_idx()
         gc.collect()
@@ -535,35 +472,6 @@ class BlockOptimizer(Optimizer):
         scale = avg_mean / avgsq_mean
 
         return scale
-
-    def _cal_avgsq_mean(self):
-        """calculate the mean of the second moment of the Adam optimizer."""
-        opt_state = self.base_optimizer.state
-        active_params = list(opt_state.keys())
-
-        # first step
-        if len(active_params) == 0:
-            return 0.
-
-        avgsq_mean = torch.cat([torch.sqrt(opt_state[p]["exp_avg_sq"]).flatten() for p in active_params]).mean()
-
-        return avgsq_mean
-
-    def _set_init_avgsq_scale(self, scale):
-        """initialize the second moment of the Adam optimizer with a specified scale instead of zeros."""
-        adam_beta2 = self.base_optimizer.defaults["betas"][1]
-        scale = (1 - adam_beta2) * self.init_avgsq_scale # bias correction
-
-        states = self.base_optimizer.state
-        for group in self.base_optimizer.param_groups:
-            for p in group["params"]:
-                state = states[p]
-                state["step"] = torch.tensor(0, device=p.device, dtype=p.dtype)
-                state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                state["exp_avg_sq"] = scale * torch.ones_like(p, memory_format=torch.preserve_format)
-                if group["amsgrad"]:
-                    state["max_exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-        
 
     def _switch_trainable_params_zero3(self) -> None:
         assert not hasattr(self, "param_idx2lp") and not hasattr(self, "param_idx2hp")        
@@ -691,302 +599,3 @@ class BlockOptimizer(Optimizer):
             self.current_block_idx = (self.current_block_idx - 1) % self.block_num
         elif self.switch_mode == "fixed":
             pass
-            
-class BlockOptimizerRatio(Optimizer):
-    """
-    BlockOptimizerRatio is an extension of BlockOptimizer, where each block contains a part of trainable weights
-    Args:
-        param_groups (list): List of parameter groups.
-        named_parameters_list (list): List of named parameters.
-        update_ratio (float, optional): The update ratio for sparsification. Defaults to 0.1.
-        switch_every (int, optional): Number of steps before switching to new parameter groups. Defaults to 100.
-        preserve_threshold (int, optional): Threshold for preserving the whole gradient when parameter is too small. Defaults to 100.
-        param_update_ratios (defaultdict, optional): Dictionary of parameter update ratios for specific parameter heads. Defaults to defaultdict(lambda: None).
-        mask_mode (str, optional): Choices: ("adjacent", "scatter"). "adjacent" mode selects a group of adjacent entries in the matrix, while "scatter" selects random entries in the matrix.
-        keep_mask (bool, optional): Flag to keep the mask. Defaults to True.
-        include_embedding (bool, optional): Flag to include the embedding layer in optimization. Defaults to False.
-    """
-
-    def __init__(self, param_groups, 
-                 named_parameters_list,
-                 update_ratio=0.1, 
-                 verbose=1, 
-                 switch_every=100, 
-                 preserve_threshold=100, 
-                 param_update_ratios=defaultdict(lambda: None),
-                 mask_mode = "adjacent",
-                 lr=1e-5,
-                 betas=(0.9, 0.999), 
-                 eps=1e-8,
-                 optimizer_defaults=None,
-                 keep_mask=True,
-                 include_embedding=False,
-                 include_lm_head=False
-                 ):
-        self.update_ratio = update_ratio
-        self.verbose = verbose
-        self.sparse_hook = self.sparse_update_hook()
-        self.param_groups = param_groups
-        self.named_parameters_list = named_parameters_list
-        self.sparse_dict = defaultdict(lambda: {})
-        self.switch_every = switch_every
-        self.preserve_threshold = preserve_threshold
-        self.global_step = 0
-        self.current_block_index = 0
-        self.include_embedding = include_embedding
-        
-        self.param_num = len(named_parameters_list)
-        self.ordered_named_params = []
-        
-        if not include_embedding:
-            self.embedding_layer.requires_grad_(False)
-        if not include_lm_head:
-            self.lm_head_layer.requires_grad_(False)
-        
-        # mask
-        self.mask_mode = mask_mode
-        self.keep_mask = keep_mask
-        self.mask_dict = {}
-        
-        for n, p in named_parameters_list:
-            if p.requires_grad:
-                p.register_post_accumulate_grad_hook(self.sparse_hook)
-            self.sparse_dict[p]["offset"] = 0
-            self.sparse_dict[p]["seed"] = torch.randint(0, 1000, (1,)).item() # seed for each parameter's random index generator
-
-            for param_name_prefix in param_update_ratios.keys():
-                if param_name_prefix in n:
-                    self.sparse_dict[p]["update_ratio"] = param_update_ratios[param_name_prefix]
-                    continue
-                    
-        defaults = dict(lr=lr, betas=betas, eps=eps) if optimizer_defaults is None else optimizer_defaults
-        super().__init__(self.param_groups, defaults)
-
-    @property
-    def embedding_layer(self):
-        for n, p in self.named_parameters_list:
-            if "embed" in n:
-                return p
-            
-    @property
-    def lm_head_layer(self):
-        for n, p in self.named_parameters_list:
-            if "lm_head" in n:
-                return p
-    
-    def _sparse_adam(self,
-                    params: List[Tensor],
-                    grads: List[Tensor],
-                    exp_avgs: List[Tensor],
-                    exp_avg_sqs: List[Tensor],
-                    state_steps: List[int],
-                    *,
-                    eps: float,
-                    beta1: float,
-                    beta2: float,
-                    lr: float,
-                    maximize: bool):
-        """
-        Functional API that performs Sparse Adam algorithm computation.
-
-        Args:
-            params (List[Tensor]): List of parameters.
-            grads (List[Tensor]): List of gradients.
-            exp_avgs (List[Tensor]): List of exponential moving average of gradients.
-            exp_avg_sqs (List[Tensor]): List of exponential moving average of squared gradients.
-            state_steps (List[int]): List of steps for each parameter group update.
-            eps (float): Term added to the denominator to improve numerical stability.
-            beta1 (float): Coefficient used for computing running averages of gradient.
-            beta2 (float): Coefficient used for computing running averages of squared gradient.
-            lr (float): Learning rate.
-            maximize (bool): Flag to indicate if maximizing the objective function.
-
-        """
-        for i, param in enumerate(params):
-            grad = grads[i]
-            grad = grad if not maximize else -grad
-            grad = grad.coalesce()  # the update is non-linear so indices must be unique
-            grad_indices = grad._indices()
-            grad_values = grad._values()
-            size = grad.size()
-
-            exp_avg = exp_avgs[i]
-            exp_avg_sq = exp_avg_sqs[i]
-            step = state_steps[i]
-
-            def make_sparse(values):
-                constructor = grad.new
-                if grad_indices.dim() == 0 or values.dim() == 0:
-                    return constructor().resize_as_(grad)
-                return constructor(grad_indices, values, size)
-
-            # Decay the first and second moment running average coefficient
-            #      old <- b * old + (1 - b) * new
-            # <==> old += (1 - b) * (new - old)
-            exp_avg_update = grad_values.sub(exp_avg).mul_(1 - beta1)
-            exp_avg.add_(exp_avg_update)
-            exp_avg_sq_update = grad_values.pow(2).sub_(exp_avg_sq).mul_(1 - beta2)
-            exp_avg_sq.add_(exp_avg_sq_update)
-
-            # Dense addition again is intended, avoiding another sparse_mask
-            numer = exp_avg.clone()
-            denom = exp_avg_sq.clone().sqrt_().add_(eps)
-            del exp_avg_update, exp_avg_sq_update
-
-            bias_correction1 = 1 - beta1 ** step
-            bias_correction2 = 1 - beta2 ** step
-            step_size = lr * math.sqrt(bias_correction2) / bias_correction1
-
-            update_direction = make_sparse(numer.div_(denom))
-            param.add_(-step_size * update_direction)
-            
-            del update_direction
-
-    
-    @torch.no_grad()
-    def step(self, closure=None):
-        """Performs a single AdamW optimization step, adjusted for Block Optimizer
-
-        Args:
-            closure (Callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            state_steps = []
-            beta1, beta2 = group['betas']
-            maximize = group.get('maximize', False)
-
-            for p in group['params']:
-                if p.grad is not None:
-                    params_with_grad.append(p)
-                    if not p.grad.is_sparse:
-                        raise RuntimeError('SparseAdam does not support dense gradients, please consider Adam instead')
-                    grads.append(p.grad)
-
-                    state = self.state[p]
-
-                    # State initialization
-                    if len(state) == 0:
-                        state['step'] = 0
-                        state['exp_avg'] = torch.zeros_like(p.grad._values()) # NOTE: now the exp_avg is a vector instead of matrix, since we only store the states for the non-zero entries
-                        
-                        # Exponential moving average of squared gradient values
-                        state['exp_avg_sq'] = torch.zeros_like(p.grad._values())
-
-                    exp_avgs.append(state['exp_avg'])
-                    exp_avg_sqs.append(state['exp_avg_sq'])
-
-                    # update the steps for each param group update
-                    state['step'] += 1
-                    # record the step after step update
-                    state_steps.append(state['step'])
-
-            self._sparse_adam(params_with_grad,
-                          grads,
-                          exp_avgs,
-                          exp_avg_sqs,
-                          state_steps,
-                          beta1=beta1,
-                          beta2=beta2,
-                          lr=group['lr'],
-                          eps=group['eps'],
-                          maximize=maximize)
-
-        self.global_step += 1
-        torch.cuda.empty_cache()
-        
-        if self.global_step % self.switch_every == 0:
-            self._reset_state_dict()
-
-        return loss
-    
-    def _reset_state_dict(self):
-        for group in self.param_groups:
-            for p in group["params"]:
-                self.state[p] = defaultdict()
-    
-    def _generate_mask_adjacent(self, param, ratio, offset):
-        """select a group of adjacent entries in the matrix, starting from the offset. If the end of the matrix is reached, continue from the beginning."""
-        num_elements = param.numel()
-        num_ones = int(num_elements * ratio)
-        
-        if offset + num_ones > num_elements:
-            i1 = torch.arange(0, offset + num_ones - num_elements, device=param.device).unsqueeze(0)
-            i2 = torch.arange(offset, num_elements, device=param.device).unsqueeze(0)
-            i = torch.cat([i1, i2], dim=1)
-        else:
-            i = torch.arange(offset, min(offset + num_ones, num_elements), device=param.device).unsqueeze(0)
-        unraveled_i = torch.vstack(torch.unravel_index(i, param.size()))
-        mask = torch.sparse_coo_tensor(unraveled_i, torch.ones(num_ones, device=param.device, dtype=param.dtype), param.shape)
-        
-        return mask
-    
-    def _generate_mask_scatter(self, param, ratio, offset):
-        """randomly select entries in the matrix. The selected entries are not necessarily adjacent.
-        The indices are recorded by setting the seed.
-        """
-        num_elements = param.numel()
-        num_ones = int(num_elements * ratio)
-        
-        torch.random.manual_seed(self.sparse_dict[param]["seed"]) # NOTE: comment this seems to provide faster convergence.
-        randperm = torch.randperm(num_elements, device=param.device)
-        if offset + num_ones > num_elements:
-            i1 = randperm[offset:]
-            i2 = randperm[:offset + num_ones - num_elements]
-            i = torch.cat([i1, i2])
-        else:
-            i = randperm[offset:offset+num_ones]
-        
-        unraveled_i = torch.vstack(torch.unravel_index(i, param.size()))
-        mask = torch.sparse_coo_tensor(unraveled_i, torch.ones(num_ones, device=param.device, dtype=param.dtype), param.shape)
-        
-        return mask
-    
-    def sparse_update_hook(self):
-
-        def func(p):
-
-            num_elements = p.numel()
-            offset = self.sparse_dict[p]["offset"]
-            update_ratio = self.sparse_dict[p]["update_ratio"] if "update_ratio" in self.sparse_dict[p] else self.update_ratio
-            
-            # when the parameter is too small, we simply sparsify the whole gradient
-            if num_elements < self.preserve_threshold:
-                p.grad = p.grad.add_(1e-9).to_sparse()
-            
-            if update_ratio == 1.: # TODO: temporary inefficient fix, need to make a sparse mask
-                p.grad = p.grad.add_(1e-9).to_sparse()
-            else:
-                if p.shape in self.mask_dict and self.mask_dict[p.shape] is not None:
-                    mask = self.mask_dict[p.shape]
-                else:
-                    if self.mask_mode == "adjacent":
-                        mask = self._generate_mask_adjacent(p, update_ratio, offset)
-                    elif self.mask_mode == "scatter":
-                        mask = self._generate_mask_scatter(p, update_ratio, offset)
-                    else:
-                        raise NotImplementedError
-                    
-                    # We save the same mask for all the parameters with the same shape, this treats memory for time.
-                    if self.keep_mask:
-                        self.mask_dict[p.shape] = mask
-                
-                p.grad = p.grad.sparse_mask(mask)
-                    
-                if (self.global_step + 1) % self.switch_every == 0:
-                    self.sparse_dict[p]["offset"] = (offset + int(num_elements * update_ratio)) % num_elements
-                    self.mask_dict[p.shape] = None
-            
-            # return p
-        
-        return func

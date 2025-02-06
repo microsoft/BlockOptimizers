@@ -1,7 +1,7 @@
 # BlockOptimizers
 This repository implements
-* BAdam algorithm from "BAdam: A Memory Efficient Full Parameter Optimization Method for Large Language Models"
-* BREAD algorithmic framework from "Accelerating Block Coordinate Descent for LLM Finetuning via Landscape Correction"
+* BAdam algorithm from "[BAdam: A Memory Efficient Full Parameter Optimization Method for Large Language Models](https://arxiv.org/abs/2404.02827)"
+* BREAD algorithmic framework from "[Accelerating Block Coordinate Descent for LLM Finetuning via Landscape Correction](https://openreview.net/forum?id=zs6bRl05g8)"
 
 The implementation is built upon the code base https://github.com/Ledzy/BAdam. The code supports model-parallel training offered by Deepspeed ZeRO-3.
 
